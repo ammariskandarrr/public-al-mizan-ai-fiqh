@@ -1,0 +1,7 @@
+{
+  "name": "Al Mizan - AI Fiqh Platform",
+  "description": "An AI-powered Islamic financial and Fiqh consultation platform featuring document analysis and real-time voice assistance.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}

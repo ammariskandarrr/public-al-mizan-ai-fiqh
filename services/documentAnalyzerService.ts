@@ -1,0 +1,829 @@
+/**
+ * Document Analyzer Service - Multi-Agent Shariah Compliance Review
+ * Implements the blueprint architecture with 4 specialized agents + Gemini aggregator
+ * With fallback to OpenAI if Gemini fails
+ */
+
+import { GoogleGenAI } from "@google/genai";
+import { openai, ChatMessage as OpenAIChatMessage } from './openaiService';
+
+// Initialize Gemini for final synthesis
+const ai = new GoogleGenAI({ apiKey: import.meta.env.VITE_GEMINI_API_KEY || import.meta.env.GEMINI_API_KEY });
+
+// Models
+const SPECIALIST_MODEL = 'gpt-4o-mini'; // Fast and efficient for sub-agents
+const AGGREGATOR_MODEL = 'gemini-2.5-pro'; // High context window for final synthesis
+const EXTRACTION_MODEL = 'gemini-3-flash-preview'; // Gemini 3 for better PDF handling
+const FALLBACK_MODEL = 'gpt-4.1-mini'; // Fallback if Gemini fails
+
+// Supabase credentials
+const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL || 'https://wndnznopltyrbiujyhgh.supabase.co';
+const SUPABASE_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY;
+
+// Agent status callback type
+export type AgentProgressCallback = (agentName: string, status: 'pending' | 'analyzing' | 'completed' | 'error', message?: string) => void;
+
+// Agent finding interface
+export interface AgentFinding {
+    clause_text: string;
+    issue_description: string;
+    severity: 'High' | 'Medium' | 'Low';
+    authority_reference: string;
+    recommendation: string;
+    location?: string;
+}
+
+// Individual agent analysis result
+export interface AgentAnalysisResult {
+    agent_name: string;
+    status: 'Compliant' | 'Compliant with Conditions' | 'Non-Compliant';
+    findings: AgentFinding[];
+    summary: string;
+    processing_time_ms: number;
+}
+
+// Final consolidated report
+export interface DocumentAnalysisReport {
+    compliance_status: 'Compliant' | 'Compliant with Conditions' | 'Non-Compliant';
+    overall_score: number;
+    executive_summary: string;
+    problematic_clauses: {
+        exact_text: string;
+        issue_description: string;
+        authority_reference: string;
+        severity: 'High' | 'Medium' | 'Low';
+        recommendation: string;
+        detected_by: string[];
+        location?: string;
+    }[];
+    compliant_aspects: string[];
+    recommendations: string[];
+    agent_analyses: {
+        bnm_resolutions: AgentAnalysisResult;
+        ifsa: AgentAnalysisResult;
+        contract_framework: AgentAnalysisResult;
+        mufti_fatwas: AgentAnalysisResult;
+    };
+    processing_time_seconds: number;
+}
+
+/**
+ * Console logger with timestamp and category
+ */
+function log(category: string, message: string, data?: any) {
+    const timestamp = new Date().toISOString().split('T')[1].split('.')[0];
+    const prefix = `[${timestamp}] [DocumentAnalyzer] [${category}]`;
+
+    if (data) {
+        console.log(`${prefix} ${message}`, data);
+    } else {
+        console.log(`${prefix} ${message}`);
+    }
+}
+
+/**
+ * Query vector database for agent-specific context
+ */
+async function queryVectorDB(
+    tableName: string,
+    queryEmbedding: number[],
+    matchCount: number = 5
+): Promise<string> {
+    log('RAG', `Querying ${tableName} for context...`);
+
+    try {
+        const response = await fetch(`${SUPABASE_URL}/rest/v1/rpc/match_${tableName}`, {
+            method: 'POST',
+            headers: {
+                'apikey': SUPABASE_KEY,
+                'Authorization': `Bearer ${SUPABASE_KEY}`,
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+                query_embedding: queryEmbedding,
+                match_count: matchCount,
+                match_threshold: 0.3,
+            }),
+        });
+
+        if (response.ok) {
+            const data = await response.json();
+            log('RAG', `Found ${data.length} results from ${tableName}`);
+            return data.map((item: any, i: number) =>
+                `[Reference ${i + 1}] ${item.metadata?.title || 'Source'}\n${item.content}\n(Similarity: ${(item.similarity * 100).toFixed(0)}%)`
+            ).join('\n\n---\n\n');
+        } else {
+            log('RAG', `Failed to query ${tableName}: ${response.status}`);
+        }
+    } catch (error) {
+        log('RAG', `Error querying ${tableName}:`, error);
+    }
+
+    return "No relevant context found in knowledge base.";
+}
+
+/**
+ * Agent A: BNM Shariah Resolutions Agent
+ */
+async function runBNMResolutionsAgent(
+    documentText: string,
+    queryEmbedding: number[],
+    onProgress?: AgentProgressCallback
+): Promise<AgentAnalysisResult> {
+    const startTime = Date.now();
+    const agentName = 'BNM Shariah Resolutions';
+
+    log('Agent-A', 'Starting BNM Resolutions Agent...');
+
+    try {
+        onProgress?.(agentName, 'analyzing', 'Checking against BNM Resolutions...');
+
+        const ragContext = await queryVectorDB('bnm_resolutions', queryEmbedding, 5);
+        log('Agent-A', `RAG context length: ${ragContext.length} chars`);
+
+        const systemPrompt = `You are a specialist in Bank Negara Malaysia Shariah Resolutions.
+Analyze documents for compliance with SAC rulings, focusing on Tawarruq and Commodity Murabahah.
+For each issue, cite the resolution number and recommend corrective action.`;
+
+        const userPrompt = `Analyze this document for compliance with BNM Shariah Resolutions.
+
+DOCUMENT TEXT:
+${documentText}
+
+RELEVANT BNM RESOLUTIONS:
+${ragContext}
+
+Return your analysis in this JSON format:
+{
+  "status": "Compliant" | "Compliant with Conditions" | "Non-Compliant",
+  "findings": [
+    {
+      "clause_text": "exact text from document",
+      "issue_description": "what the issue is",
+      "severity": "High" | "Medium" | "Low",
+      "authority_reference": "BNM SAC Resolution X.X: ...",
+      "recommendation": "how to fix it",
+      "location": "page/section if identifiable"
+    }
+  ],
+  "summary": "brief summary of findings"
+}`;
+
+        const messages: OpenAIChatMessage[] = [
+            { role: 'system', content: systemPrompt },
+            { role: 'user', content: userPrompt }
+        ];
+
+        log('Agent-A', `Document text length: ${documentText.length} chars`);
+        log('Agent-A', `Sending prompt with ${ragContext.length} chars of RAG context`);
+        log('Agent-A', 'Calling OpenAI API...');
+        const response = await openai.chatCompletion(messages, {
+            model: SPECIALIST_MODEL,
+            temperature: 0.1,
+            maxTokens: 2000,
+        });
+
+        const rawResponse = response.choices[0].message.content;
+        log('Agent-A', `Raw LLM response (first 500 chars): ${rawResponse.substring(0, 500)}`);
+
+        const result = parseAgentResponse(rawResponse, agentName);
+        result.processing_time_ms = Date.now() - startTime;
+
+        log('Agent-A', `Completed in ${result.processing_time_ms}ms, found ${result.findings.length} findings`);
+        log('Agent-A', `Status: ${result.status}, Summary: ${result.summary}`);
+        onProgress?.(agentName, 'completed', `Found ${result.findings.length} findings`);
+        return result;
+
+    } catch (error) {
+        log('Agent-A', 'FAILED:', error);
+        onProgress?.(agentName, 'error', 'Analysis failed');
+        return createErrorResult(agentName, startTime);
+    }
+}
+
+/**
+ * Agent B: IFSA 2013 Agent
+ */
+async function runIFSAAgent(
+    documentText: string,
+    queryEmbedding: number[],
+    onProgress?: AgentProgressCallback
+): Promise<AgentAnalysisResult> {
+    const startTime = Date.now();
+    const agentName = 'Islamic Financial Services Act 2013';
+
+    log('Agent-B', 'Starting IFSA Agent...');
+
+    try {
+        onProgress?.(agentName, 'analyzing', 'Verifying IFSA compliance...');
+
+        const ragContext = await queryVectorDB('islamic_financial_act', queryEmbedding, 5);
+
+        const systemPrompt = `You are a specialist in the Islamic Financial Services Act 2013 (IFSA).
+Check for regulatory compliance, licensing, and Shariah governance requirements.
+Cite specific IFSA sections for any violations found.`;
+
+        const userPrompt = `Analyze this document for compliance with IFSA 2013.
+
+DOCUMENT TEXT:
+${documentText}
+
+RELEVANT IFSA PROVISIONS:
+${ragContext}
+
+Return your analysis in this JSON format:
+{
+  "status": "Compliant" | "Compliant with Conditions" | "Non-Compliant",
+  "findings": [
+    {
+      "clause_text": "exact text from document",
+      "issue_description": "what the issue is",
+      "severity": "High" | "Medium" | "Low",
+      "authority_reference": "IFSA Section X: ...",
+      "recommendation": "how to fix it",
+      "location": "page/section if identifiable"
+    }
+  ],
+  "summary": "brief summary of findings"
+}`;
+
+        const messages: OpenAIChatMessage[] = [
+            { role: 'system', content: systemPrompt },
+            { role: 'user', content: userPrompt }
+        ];
+
+        log('Agent-B', 'Calling OpenAI API...');
+        const response = await openai.chatCompletion(messages, {
+            model: SPECIALIST_MODEL,
+            temperature: 0.1,
+            maxTokens: 2000,
+        });
+
+        const result = parseAgentResponse(response.choices[0].message.content, agentName);
+        result.processing_time_ms = Date.now() - startTime;
+
+        log('Agent-B', `Completed in ${result.processing_time_ms}ms, found ${result.findings.length} findings`);
+        onProgress?.(agentName, 'completed', `Found ${result.findings.length} findings`);
+        return result;
+
+    } catch (error) {
+        log('Agent-B', 'FAILED:', error);
+        onProgress?.(agentName, 'error', 'Analysis failed');
+        return createErrorResult(agentName, startTime);
+    }
+}
+
+/**
+ * Agent C: BNM Shariah Contract Framework Agent
+ */
+async function runContractFrameworkAgent(
+    documentText: string,
+    queryEmbedding: number[],
+    onProgress?: AgentProgressCallback
+): Promise<AgentAnalysisResult> {
+    const startTime = Date.now();
+    const agentName = 'BNM Contract Framework';
+
+    log('Agent-C', 'Starting Contract Framework Agent...');
+
+    try {
+        onProgress?.(agentName, 'analyzing', 'Checking contract structure...');
+
+        const ragContext = await queryVectorDB('shariah_contract_framework', queryEmbedding, 5);
+
+        const systemPrompt = `You are a specialist in BNM's Shariah Contract Framework.
+Verify that contracts follow proper structures (Rukun and Shurut) and valid pricing mechanisms.
+Ensure alignment with BNM's prescribed frameworks for specific contracts.`;
+
+        const userPrompt = `Analyze this document against BNM Shariah Contract Framework.
+
+DOCUMENT TEXT:
+${documentText}
+
+RELEVANT FRAMEWORK GUIDELINES:
+${ragContext}
+
+Return your analysis in this JSON format:
+{
+  "status": "Compliant" | "Compliant with Conditions" | "Non-Compliant",
+  "findings": [
+    {
+      "clause_text": "exact text from document",
+      "issue_description": "what the issue is",
+      "severity": "High" | "Medium" | "Low",
+      "authority_reference": "BNM Contract Framework: ...",
+      "recommendation": "how to fix it",
+      "location": "page/section if identifiable"
+    }
+  ],
+  "summary": "brief summary of findings"
+}`;
+
+        const messages: OpenAIChatMessage[] = [
+            { role: 'system', content: systemPrompt },
+            { role: 'user', content: userPrompt }
+        ];
+
+        log('Agent-C', 'Calling OpenAI API...');
+        const response = await openai.chatCompletion(messages, {
+            model: SPECIALIST_MODEL,
+            temperature: 0.1,
+            maxTokens: 2000,
+        });
+
+        const result = parseAgentResponse(response.choices[0].message.content, agentName);
+        result.processing_time_ms = Date.now() - startTime;
+
+        log('Agent-C', `Completed in ${result.processing_time_ms}ms, found ${result.findings.length} findings`);
+        onProgress?.(agentName, 'completed', `Found ${result.findings.length} findings`);
+        return result;
+
+    } catch (error) {
+        log('Agent-C', 'FAILED:', error);
+        onProgress?.(agentName, 'error', 'Analysis failed');
+        return createErrorResult(agentName, startTime);
+    }
+}
+
+/**
+ * Agent D: Mufti Fatwa Agent
+ */
+async function runMuftiFatwaAgent(
+    documentText: string,
+    queryEmbedding: number[],
+    onProgress?: AgentProgressCallback
+): Promise<AgentAnalysisResult> {
+    const startTime = Date.now();
+    const agentName = 'Mufti Fatwas';
+
+    log('Agent-D', 'Starting Mufti Fatwa Agent...');
+
+    try {
+        onProgress?.(agentName, 'analyzing', 'Consulting Mufti rulings...');
+
+        const ragContext = await queryVectorDB('mufti_qa', queryEmbedding, 5);
+
+        const systemPrompt = `You are a specialist in Mufti interpretations and Fatwas.
+Provide scholarly Fiqh perspective on Maqasid al-Shariah and ethical considerations.
+Identify any issues related to Riba, Gharar, or Maisir based on fatwa rulings.`;
+
+        const userPrompt = `Analyze this document from a Fiqh and Fatwa perspective.
+
+DOCUMENT TEXT:
+${documentText}
+
+RELEVANT MUFTI RULINGS:
+${ragContext}
+
+Return your analysis in this JSON format:
+{
+  "status": "Compliant" | "Compliant with Conditions" | "Non-Compliant",
+  "findings": [
+    {
+      "clause_text": "exact text from document",
+      "issue_description": "what the issue is",
+      "severity": "High" | "Medium" | "Low",
+      "authority_reference": "Mufti Ruling/Fatwa: ...",
+      "recommendation": "how to fix it",
+      "location": "page/section if identifiable"
+    }
+  ],
+  "summary": "brief summary of findings"
+}`;
+
+        const messages: OpenAIChatMessage[] = [
+            { role: 'system', content: systemPrompt },
+            { role: 'user', content: userPrompt }
+        ];
+
+        log('Agent-D', 'Calling OpenAI API...');
+        const response = await openai.chatCompletion(messages, {
+            model: SPECIALIST_MODEL,
+            temperature: 0.1,
+            maxTokens: 2000,
+        });
+
+        const result = parseAgentResponse(response.choices[0].message.content, agentName);
+        result.processing_time_ms = Date.now() - startTime;
+
+        log('Agent-D', `Completed in ${result.processing_time_ms}ms, found ${result.findings.length} findings`);
+        onProgress?.(agentName, 'completed', `Found ${result.findings.length} findings`);
+        return result;
+
+    } catch (error) {
+        log('Agent-D', 'FAILED:', error);
+        onProgress?.(agentName, 'error', 'Analysis failed');
+        return createErrorResult(agentName, startTime);
+    }
+}
+
+/**
+ * Parse agent JSON response
+ */
+function parseAgentResponse(responseText: string, agentName: string): AgentAnalysisResult {
+    try {
+        let cleanText = responseText
+            .replace(/```json\n?/g, '')
+            .replace(/```\n?/g, '')
+            .trim();
+
+        const match = cleanText.match(/\{[\s\S]*\}/);
+        if (match) {
+            const parsed = JSON.parse(match[0]);
+            return {
+                agent_name: agentName,
+                status: parsed.status || 'Compliant with Conditions',
+                findings: parsed.findings || [],
+                summary: parsed.summary || 'Analysis complete.',
+                processing_time_ms: 0
+            };
+        }
+    } catch (e) {
+        log('Parse', `Failed to parse ${agentName} response:`, e);
+    }
+
+    return {
+        agent_name: agentName,
+        status: 'Compliant with Conditions',
+        findings: [],
+        summary: 'Unable to parse analysis results.',
+        processing_time_ms: 0
+    };
+}
+
+/**
+ * Create error result for failed agent
+ */
+function createErrorResult(agentName: string, startTime: number): AgentAnalysisResult {
+    return {
+        agent_name: agentName,
+        status: 'Compliant with Conditions',
+        findings: [],
+        summary: 'Agent encountered an error during analysis.',
+        processing_time_ms: Date.now() - startTime
+    };
+}
+
+/**
+ * Final Synthesis Agent (Gemini 2.5 Pro with OpenAI fallback)
+ */
+async function runFinalSynthesisAgent(
+    documentText: string,
+    agentResults: {
+        bnm_resolutions: AgentAnalysisResult;
+        ifsa: AgentAnalysisResult;
+        contract_framework: AgentAnalysisResult;
+        mufti_fatwas: AgentAnalysisResult;
+    },
+    onProgress?: AgentProgressCallback
+): Promise<DocumentAnalysisReport> {
+    const startTime = Date.now();
+
+    log('Synthesis', 'Starting Final Synthesis Agent...');
+
+    const systemPrompt = `You are the Final Synthesis Agent for Shariah Document Analysis.
+Consolidate findings from 4 specialist agents into a single audit report.
+Deduplicate issues, prioritize regulatory findings, and map evidence to specific text.`;
+
+    const userPrompt = `Synthesize the following agent analyses into a comprehensive Shariah compliance report.
+
+DOCUMENT (First 1000 chars):
+${documentText.slice(0, 1000)}
+
+AGENT ANALYSES:
+
+1. BNM RESOLUTIONS AGENT:
+Status: ${agentResults.bnm_resolutions.status}
+Summary: ${agentResults.bnm_resolutions.summary}
+Findings: ${JSON.stringify(agentResults.bnm_resolutions.findings, null, 2)}
+
+2. IFSA 2013 AGENT:
+Status: ${agentResults.ifsa.status}
+Summary: ${agentResults.ifsa.summary}
+Findings: ${JSON.stringify(agentResults.ifsa.findings, null, 2)}
+
+3. CONTRACT FRAMEWORK AGENT:
+Status: ${agentResults.contract_framework.status}
+Summary: ${agentResults.contract_framework.summary}
+Findings: ${JSON.stringify(agentResults.contract_framework.findings, null, 2)}
+
+4. MUFTI FATWA AGENT:
+Status: ${agentResults.mufti_fatwas.status}
+Summary: ${agentResults.mufti_fatwas.summary}
+Findings: ${JSON.stringify(agentResults.mufti_fatwas.findings, null, 2)}
+
+Return a consolidated report in this JSON format:
+{
+  "compliance_status": "Compliant" | "Compliant with Conditions" | "Non-Compliant",
+  "overall_score": <0-100>,
+  "executive_summary": "2-3 sentence high-level summary",
+  "problematic_clauses": [
+    {
+      "exact_text": "exact clause from document",
+      "issue_description": "consolidated issue description",
+      "authority_reference": "primary authority violated",
+      "severity": "High" | "Medium" | "Low",
+      "recommendation": "corrective action",
+      "detected_by": ["agent names that found this"],
+      "location": "page/section"
+    }
+  ],
+  "compliant_aspects": ["positive findings"],
+  "recommendations": ["actionable recommendations"]
+}
+
+IMPORTANT:
+- Deduplicate similar findings from multiple agents
+- Prioritize regulatory (IFSA/BNM) over interpretive (Mufti) findings
+- Ensure exact_text matches document content for highlighting
+- Score: 100 = fully compliant, 0 = major violations`;
+
+    // Try Gemini first
+    try {
+        onProgress?.('Final Synthesis', 'analyzing', 'Consolidating with Gemini 2.5 Pro...');
+        log('Synthesis', 'Trying Gemini 2.5 Pro...');
+
+        const response = await ai.models.generateContent({
+            model: AGGREGATOR_MODEL,
+            contents: { parts: [{ text: userPrompt }] },
+            config: {
+                systemInstruction: systemPrompt,
+            }
+        });
+
+        const responseText = response.text || '';
+        log('Synthesis', `Gemini response received (${responseText.length} chars)`);
+
+        const report = parseFinalReport(responseText, agentResults, startTime);
+        onProgress?.('Final Synthesis', 'completed', 'Report generated with Gemini');
+        return report;
+
+    } catch (geminiError) {
+        log('Synthesis', 'Gemini FAILED, falling back to OpenAI...', geminiError);
+        onProgress?.('Final Synthesis', 'analyzing', 'Falling back to OpenAI 4.1 mini...');
+
+        // Fallback to OpenAI
+        try {
+            const messages: OpenAIChatMessage[] = [
+                { role: 'system', content: systemPrompt },
+                { role: 'user', content: userPrompt }
+            ];
+
+            const response = await openai.chatCompletion(messages, {
+                model: FALLBACK_MODEL,
+                temperature: 0.1,
+                maxTokens: 4000,
+            });
+
+            const responseText = response.choices[0].message.content;
+            log('Synthesis', `OpenAI fallback response received (${responseText.length} chars)`);
+
+            const report = parseFinalReport(responseText, agentResults, startTime);
+            onProgress?.('Final Synthesis', 'completed', 'Report generated with OpenAI fallback');
+            return report;
+
+        } catch (openaiError) {
+            log('Synthesis', 'OpenAI fallback ALSO FAILED:', openaiError);
+            onProgress?.('Final Synthesis', 'error', 'Both Gemini and OpenAI failed');
+            return createFallbackReport(agentResults, startTime);
+        }
+    }
+}
+
+/**
+ * Parse final synthesis report
+ */
+function parseFinalReport(
+    responseText: string,
+    agentResults: any,
+    startTime: number
+): DocumentAnalysisReport {
+    try {
+        let cleanText = responseText
+            .replace(/```json\n?/g, '')
+            .replace(/```\n?/g, '')
+            .trim();
+
+        const match = cleanText.match(/\{[\s\S]*\}/);
+        if (match) {
+            const parsed = JSON.parse(match[0]);
+
+            return {
+                compliance_status: parsed.compliance_status || 'Compliant with Conditions',
+                overall_score: parsed.overall_score || 70,
+                executive_summary: parsed.executive_summary || 'Analysis complete.',
+                problematic_clauses: parsed.problematic_clauses || [],
+                compliant_aspects: parsed.compliant_aspects || [],
+                recommendations: parsed.recommendations || [],
+                agent_analyses: agentResults,
+                processing_time_seconds: (Date.now() - startTime) / 1000
+            };
+        }
+    } catch (e) {
+        log('Parse', 'Failed to parse final report:', e);
+    }
+
+    return createFallbackReport(agentResults, startTime);
+}
+
+/**
+ * Create fallback report when synthesis fails
+ */
+function createFallbackReport(agentResults: any, startTime: number): DocumentAnalysisReport {
+    const allFindings = [
+        ...agentResults.bnm_resolutions.findings,
+        ...agentResults.ifsa.findings,
+        ...agentResults.contract_framework.findings,
+        ...agentResults.mufti_fatwas.findings
+    ];
+
+    const problematicClauses = allFindings.map((f: AgentFinding) => ({
+        exact_text: f.clause_text,
+        issue_description: f.issue_description,
+        authority_reference: f.authority_reference,
+        severity: f.severity,
+        recommendation: f.recommendation,
+        detected_by: ['Multiple agents'],
+        location: f.location
+    }));
+
+    const highSeverityCount = allFindings.filter((f: AgentFinding) => f.severity === 'High').length;
+    const score = Math.max(0, 100 - (highSeverityCount * 20) - (allFindings.length * 5));
+
+    return {
+        compliance_status: score > 80 ? 'Compliant' : score > 50 ? 'Compliant with Conditions' : 'Non-Compliant',
+        overall_score: score,
+        executive_summary: `Analysis complete. ${allFindings.length} findings identified across 4 specialist agents.`,
+        problematic_clauses: problematicClauses,
+        compliant_aspects: [],
+        recommendations: ['Review individual agent analyses for detailed findings'],
+        agent_analyses: agentResults,
+        processing_time_seconds: (Date.now() - startTime) / 1000
+    };
+}
+
+/**
+ * Main document analysis function
+ * Uploads file directly to model (no text extraction step)
+ */
+export async function analyzeDocumentWithAgents(
+    fileBase64: string,
+    mimeType: string,
+    onProgress?: AgentProgressCallback
+): Promise<DocumentAnalysisReport> {
+    log('Main', '====== STARTING MULTI-AGENT ANALYSIS ======');
+    log('Main', `File type: ${mimeType}, Base64 length: ${fileBase64.length}`);
+    const overallStartTime = Date.now();
+
+    try {
+        // Step 1: Extract text from document using Gemini (direct file upload)
+        onProgress?.('System', 'analyzing', 'Reading document with Gemini 2.5 Flash...');
+        log('Main', 'Step 1: Extracting text from document...');
+
+        const documentText = await extractTextFromFile(fileBase64, mimeType, onProgress);
+        log('Main', `Extracted ${documentText.length} characters from document`);
+
+        // Step 2: Generate embedding for RAG queries
+        onProgress?.('System', 'analyzing', 'Generating document embedding...');
+        log('Main', 'Step 2: Generating embedding...');
+        const queryText = documentText.slice(0, 1000);
+        const queryEmbedding = await openai.createEmbedding(queryText);
+        log('Main', 'Embedding generated successfully');
+
+        // Step 3: Run all 4 specialist agents in parallel
+        log('Main', 'Step 3: Running 4 specialist agents in PARALLEL...');
+        onProgress?.('System', 'analyzing', 'Running specialist agents...');
+
+        const [bnmResolutions, ifsa, contractFramework, muftiFatwas] = await Promise.all([
+            runBNMResolutionsAgent(documentText, queryEmbedding, onProgress),
+            runIFSAAgent(documentText, queryEmbedding, onProgress),
+            runContractFrameworkAgent(documentText, queryEmbedding, onProgress),
+            runMuftiFatwaAgent(documentText, queryEmbedding, onProgress)
+        ]);
+
+        const agentResults = {
+            bnm_resolutions: bnmResolutions,
+            ifsa: ifsa,
+            contract_framework: contractFramework,
+            mufti_fatwas: muftiFatwas
+        };
+
+        log('Main', 'All 4 agents completed');
+
+        // Step 4: Run final synthesis with Gemini 2.5 Pro (with OpenAI fallback)
+        log('Main', 'Step 4: Running final synthesis...');
+        const finalReport = await runFinalSynthesisAgent(documentText, agentResults, onProgress);
+
+        const totalTime = (Date.now() - overallStartTime) / 1000;
+        log('Main', `====== ANALYSIS COMPLETE in ${totalTime.toFixed(2)}s ======`);
+        log('Main', `Final Score: ${finalReport.overall_score}, Status: ${finalReport.compliance_status}`);
+
+        return finalReport;
+
+    } catch (error) {
+        log('Main', 'ANALYSIS FAILED:', error);
+        throw error;
+    }
+}
+
+/**
+ * Extract text from document using n8n OCR API (primary) with Gemini fallback
+ */
+async function extractTextFromFile(
+    fileBase64: string,
+    mimeType: string,
+    onProgress?: AgentProgressCallback
+): Promise<string> {
+    log('Extract', `Extracting text from ${mimeType} file...`);
+
+    // Convert base64 to binary for n8n API
+    const binaryString = atob(fileBase64);
+    const bytes = new Uint8Array(binaryString.length);
+    for (let i = 0; i < binaryString.length; i++) {
+        bytes[i] = binaryString.charCodeAt(i);
+    }
+    const blob = new Blob([bytes], { type: mimeType });
+
+    // Try n8n OCR API first (most reliable)
+    try {
+        log('Extract', 'Trying n8n OCR API (Mistral Doc OCR)...');
+        onProgress?.('System', 'analyzing', 'Processing with OCR API...');
+
+        const response = await fetch('https://n8n.ammariskandar-n8n.uk/webhook/b2f1db0b-ee85-4ca2-bfcd-313455373059', {
+            method: 'POST',
+            headers: {
+                'Content-Type': mimeType,
+            },
+            body: blob
+        });
+
+        if (response.ok) {
+            const data = await response.json();
+
+            // Extract text from the response
+            if (data && data.length > 0 && data[0].extractedText) {
+                const extractedText = data[0].extractedText;
+                log('Extract', `n8n OCR extracted ${extractedText.length} characters from ${data[0].pageCount} pages`);
+                return extractedText;
+            } else if (data && data.length > 0 && data[0].pages) {
+                // Fallback: concatenate markdown from all pages
+                const extractedText = data[0].pages.map((page: any) => page.markdown || '').join('\n\n');
+                log('Extract', `n8n OCR extracted ${extractedText.length} characters from markdown`);
+                return extractedText;
+            }
+        } else {
+            log('Extract', `n8n OCR API returned ${response.status}`);
+        }
+    } catch (ocrError) {
+        log('Extract', 'n8n OCR API FAILED, trying Gemini fallback...', ocrError);
+    }
+
+    // Fallback 1: Try Gemini 2.5 Flash
+    try {
+        log('Extract', 'Trying Gemini 2.5 Flash for extraction...');
+        onProgress?.('System', 'analyzing', 'Falling back to Gemini 2.5 Flash...');
+
+        const extractionPrompt = `Extract ALL text content from this document. 
+
+Preserve the structure including:
+- Headings and section titles
+- Clauses and numbered items
+- Any financial terms, percentages, or amounts
+- All legal/contractual language
+- Page numbers if visible
+
+Return the extracted text as plain text. Do not analyze it, just extract it.`;
+
+        const response = await ai.models.generateContent({
+            model: 'gemini-2.5-flash', // Use 2.5 instead of 3 (more stable)
+            contents: {
+                parts: [
+                    {
+                        inlineData: {
+                            mimeType: mimeType,
+                            data: fileBase64,
+                        },
+                    },
+                    {
+                        text: extractionPrompt
+                    },
+                ],
+            },
+        });
+
+        const extractedText = response.text || "";
+        log('Extract', `Gemini 2.5 Flash extracted ${extractedText.length} characters`);
+        return extractedText;
+
+    } catch (geminiError) {
+        log('Extract', 'Gemini 2.5 Flash FAILED:', geminiError);
+        throw new Error("Failed to extract document text with both n8n OCR and Gemini. Please try again or use a different document.");
+    }
+}
+
+/**
+ * Legacy export for backward compatibility
+ */
+export async function extractDocumentText(fileBase64: string, mimeType: string): Promise<string> {
+    return extractTextFromFile(fileBase64, mimeType);
+}
