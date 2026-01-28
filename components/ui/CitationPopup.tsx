@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import { X, ExternalLink, BookOpen, FileText, Building2, Hash, Percent, Copy, Check, ChevronDown, ChevronUp } from 'lucide-react';
+import { X, ExternalLink, BookOpen, FileText, Building2, Hash, Copy, Check, ChevronDown, ChevronUp } from 'lucide-react';
 import { Citation } from '../../services/supabaseClient';
 
 interface CitationPopupProps {
@@ -57,12 +57,6 @@ const getSourceDescription = (sourceId: string) => {
     }
 };
 
-const getMatchQuality = (similarity: number) => {
-    if (similarity >= 0.8) return { label: 'Excellent Match', color: 'text-emerald-700 bg-emerald-100' };
-    if (similarity >= 0.6) return { label: 'Good Match', color: 'text-blue-700 bg-blue-100' };
-    if (similarity >= 0.4) return { label: 'Moderate Match', color: 'text-amber-700 bg-amber-100' };
-    return { label: 'Partial Match', color: 'text-slate-700 bg-slate-100' };
-};
 
 const CitationPopup: React.FC<CitationPopupProps> = ({ citation, onClose }) => {
     const popupRef = useRef<HTMLDivElement>(null);
@@ -94,7 +88,6 @@ const CitationPopup: React.FC<CitationPopupProps> = ({ citation, onClose }) => {
 
 
     const Icon = getSourceIcon(citation.sourceId);
-    const matchQuality = getMatchQuality(citation.similarity);
 
     const handleCopyContent = async () => {
         try {
@@ -152,35 +145,19 @@ const CitationPopup: React.FC<CitationPopupProps> = ({ citation, onClose }) => {
                 </div>
 
                 {/* Metadata Grid */}
-                <div className="p-4 border-b border-slate-100">
-                    <div className="grid grid-cols-3 gap-3">
-                        {citation.page && (
-                            <div className="flex items-center gap-2">
-                                <div className="w-9 h-9 bg-blue-50 rounded-lg flex items-center justify-center">
-                                    <Hash size={16} className="text-blue-500" />
-                                </div>
-                                <div>
-                                    <p className="text-[10px] text-slate-400 uppercase font-semibold tracking-wide">Page</p>
-                                    <p className="text-slate-800 font-bold text-sm">{citation.page}</p>
-                                </div>
-                            </div>
-                        )}
+                {citation.page && (
+                    <div className="p-4 border-b border-slate-100">
                         <div className="flex items-center gap-2">
-                            <div className="w-9 h-9 bg-emerald-50 rounded-lg flex items-center justify-center">
-                                <Percent size={16} className="text-emerald-500" />
+                            <div className="w-9 h-9 bg-blue-50 rounded-lg flex items-center justify-center">
+                                <Hash size={16} className="text-blue-500" />
                             </div>
                             <div>
-                                <p className="text-[10px] text-slate-400 uppercase font-semibold tracking-wide">Match</p>
-                                <p className="text-slate-800 font-bold text-sm">{(citation.similarity * 100).toFixed(1)}%</p>
+                                <p className="text-[10px] text-slate-400 uppercase font-semibold tracking-wide">Page</p>
+                                <p className="text-slate-800 font-bold text-sm">{citation.page}</p>
                             </div>
                         </div>
-                        <div className="col-span-1">
-                            <span className={`inline-block text-[10px] font-semibold px-2 py-1 rounded-full ${matchQuality.color}`}>
-                                {matchQuality.label}
-                            </span>
-                        </div>
                     </div>
-                </div>
+                )}
 
                 {/* Content Preview */}
                 <div className="p-4">
